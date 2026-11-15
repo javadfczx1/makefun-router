@@ -133,14 +133,16 @@ interface Route {
 
 /**
  * The provider and model that serve one request: the free model with the highest quality-table rating among
- * every provider that answered, given the request's requirements. TODO(budget): spread calls over providers
- * under their per-trial budgets; this ranks by rating alone and ignores what a provider has left to spend.
+ * every provider that answered, given the request's requirements, skipping every provider in `exclude` (the
+ * ones a failover attempt already burned). TODO(budget): spread calls over providers under their per-trial
+ * budgets; this ranks by rating alone and ignores what a provider has left to spend.
  */
-function routeFor(requires: Requirement): Route | null {
+function routeFor(requires: Requirement, exclude?: Set<string>): Route | null {
   let best: Route | null = null;
   let bestRating = Number.NEGATIVE_INFINITY;
   for (const probe of probes) {
     if (!probe.ok) continue;
+    if (exclude?.has(probe.provider.id) === true) continue;
     for (const model of [...probe.models].sort(byId)) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
@@ -250,25 +252,53 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
-  if (route.probe.provider.wire !== 'openai') {
-    // TODO(wires): build the gemini or anthropic upstream request (and its event shape) instead of 501.
-    return sendError(res, 'openai', 501, 'not_implemented', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
+  // The manifest advances once per arriving request, so this request's requirements are read once, before the
+  // attempts: calling requirementsFor inside the loop would burn three manifest rows on one request.
+  const requires = requirementsFor(body);
+  // The providers whose call answered 402 (out of budget) or 429 (rate limited): the next attempt skips them.
+  const failedProviders = new Set<string>();
+  let upstream: Response | null = null;
+  // The last 402/429 answer, read to text as it arrives: the socket is released, and if every provider fails this
+  // is what the client gets instead of a made-up status.
+  let lastFailure: { status: number; contentType: string; text: string } | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const route = routeFor(requires, failedProviders);
+    if (route === null) break; // nothing legal left to try: answered below, from `lastFailure` or with 503
+    if (route.probe.provider.wire !== 'openai') {
+      // TODO(wires): build the gemini or anthropic upstream request (and its event shape) instead of 501.
+      return sendError(res, 'openai', 501, 'not_implemented', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
+    }
+    let answer: Response;
+    try {
+      answer = await callProvider(route, { ...body, model: route.model.id });
+    } catch (err) {
+      return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
+    }
+    if (answer.status === 402 || answer.status === 429) {
+      log(`failover: ${route.probe.provider.id}/${route.model.id} answered HTTP ${answer.status}: trying the next free model`);
+      failedProviders.add(route.probe.provider.id);
+      lastFailure = {
+        status: answer.status,
+        contentType: answer.headers.get('content-type') ?? 'application/json',
+        text: await answer.text(),
+      };
+      continue;
+    }
+    upstream = answer;
+    break; // a 200, or an error failover does not cover: handled below as the baseline did
   }
-  let upstream: Response;
-  try {
-    upstream = await callProvider(route, { ...body, model: route.model.id });
-  } catch (err) {
-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
+  if (upstream === null) {
+    if (lastFailure === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
+    res.writeHead(lastFailure.status, { 'content-type': lastFailure.contentType });
+    return void res.end(lastFailure.text);
   }
   if (body.stream === true && upstream.ok && upstream.body !== null) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     await pipeStream(upstream.body, res);
     return;
   }
-  // TODO(failover): a 402, 429 or 5xx here ends the request. Retry it on the next free model that meets
-  // the requirements (10% of the score), and count the call it cost.
+  // TODO(served): when every provider answers 402 the client still gets one 402; a 5xx ends the request with no
+  // failover attempt, no call is counted against a provider's budget, and POST /v1/messages has no failover.
   const text = await upstream.text();
   res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
   res.end(text);
