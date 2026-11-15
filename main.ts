@@ -132,22 +132,30 @@ interface Route {
 }
 
 /**
- * The provider and model that serve one request. TODO(quality): rank every free candidate that meets the
- * requirements by the quality table's rating_milli (quality is 60% of the score) and plan each provider's
- * per-trial budget. This baseline takes the first provider, in the brief's order, whose listing answered
- * with a free model meeting the requirements, and that provider's first model by id.
+ * The provider and model that serve one request: the free model with the highest quality-table rating among
+ * every provider that answered, given the request's requirements. TODO(budget): spread calls over providers
+ * under their per-trial budgets; this ranks by rating alone and ignores what a provider has left to spend.
  */
 function routeFor(requires: Requirement): Route | null {
+  let best: Route | null = null;
+  let bestRating = Number.NEGATIVE_INFINITY;
   for (const probe of probes) {
     if (!probe.ok) continue;
     for (const model of [...probe.models].sort(byId)) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      return { probe, model };
+      // The quality table is the sealed truth on quality: a model it has no row for ranks below every rated
+      // model, and stays a legal pick only when nothing rated meets the request. Ties keep the first found,
+      // which is the brief's provider order then model id, so a replay routes the same way.
+      const rating = row === null ? Number.NEGATIVE_INFINITY : row.rating_milli;
+      if (best === null || rating > bestRating) {
+        best = { probe, model };
+        bestRating = rating;
+      }
     }
   }
-  return null;
+  return best;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
